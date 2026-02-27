@@ -2,9 +2,13 @@ import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ProcessorModule } from './modules/processor/processor.module';
+import { databaseConfig } from './config/database.config';
+import { TypeOrmModule } from '@nestjs/typeorm';
 
 @Module({
-  imports: [ProcessorModule],
+  imports: [
+    TypeOrmModule.forRoot(databaseConfig),
+    ProcessorModule],
   controllers: [AppController],
   providers: [AppService],
 })
