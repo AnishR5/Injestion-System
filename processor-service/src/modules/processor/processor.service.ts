@@ -3,7 +3,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { redisClient } from 'src/config/redis.config';
 import { EventMetadata } from './entities/event-metadata.entity';
 import { Repository } from 'typeorm';
-import { openSearchClient } from 'src/config/opensearch.config';
+import { openSearchClient } from '../../config/opensearch.config';
+import { getEventIndex } from '../../common/utils/index-name.util';
 
 @Injectable()
 export class ProcessorService {
@@ -14,18 +15,82 @@ export class ProcessorService {
 
   private readonly logger = new Logger(ProcessorService.name);
 
-  async processBatch(messages: any[]) {
-    for (const [id, fields] of messages) {
-      try {
-        const event = this.parse(fields);
-        await this.handleEvent(event);
+  
+  private async bulkIndex(events: any[]) {
+  const index = getEventIndex();
 
-        await redisClient.xack('events:ingestion', 'event-processors', id);
-      } catch (error) {
-        await this.handleFailure(id, fields, error);
+  const body = [];
+
+  for (const event of events) {
+    body.push({
+      index: { _index: index, _id: event.eventId },
+    });
+
+    body.push({
+      eventId: event.eventId,
+      sourceId: event.sourceId,
+      eventType: event.payload.eventType,
+      timestamp: event.payload.timestamp,
+      metadata: event.payload.metadata,
+    });
+  }
+
+  const response = await openSearchClient.bulk({ body });
+
+  if (response.body.errors) {
+    this.logger.error('Bulk indexing had errors');
+  }
+}
+
+async processBatch(messages: any[]) {
+  const events = [];
+  const messageIds = [];
+
+  for (const [id, fields] of messages) {
+    try {
+      const event = this.parse(fields);
+
+      const existing = await this.eventRepo.findOne({
+        where: { id: event.eventId },
+      });
+
+      if (existing) {
+        await redisClient.xack(
+          'events:ingestion',
+          'event-processors',
+          id,
+        );
+        continue;
       }
+
+      await this.eventRepo.save({
+        id: event.eventId,
+        sourceId: event.sourceId,
+        eventType: event.payload.eventType,
+        eventTime: new Date(event.payload.timestamp),
+        status: 'PROCESSED',
+      });
+
+      events.push(event);
+      messageIds.push(id);
+
+    } catch (err) {
+      await this.handleFailure(id, fields, err);
     }
   }
+
+  if (events.length > 0) {
+    await this.bulkIndex(events);
+  }
+
+  if (messageIds.length > 0) {
+    await redisClient.xack(
+      'events:ingestion',
+      'event-processors',
+      ...messageIds,
+    );
+  }
+}
 
   private parse(fields: any[]) {
     const obj: any = {};
@@ -43,7 +108,7 @@ export class ProcessorService {
   });
 
   if (existing) {
-    return; // already processed
+    return; 
   }
 
   await this.eventRepo.save({
@@ -55,7 +120,7 @@ export class ProcessorService {
   });
 
   await openSearchClient.index({
-  index: `events-${new Date().toISOString().split('T')[0]}`,
+  index: getEventIndex(),
   body: {
     eventId: event.eventId,
     sourceId: event.sourceId,
