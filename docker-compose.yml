@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: events_db
+    ports:
+      - "5434:5432"
+
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9600:9600"

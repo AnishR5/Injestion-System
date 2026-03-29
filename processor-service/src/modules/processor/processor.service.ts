@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Get, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { redisClient } from 'src/config/redis.config';
 import { EventMetadata } from './entities/event-metadata.entity';
@@ -7,90 +7,118 @@ import { openSearchClient } from '../../config/opensearch.config';
 import { getEventIndex } from '../../common/utils/index-name.util';
 
 @Injectable()
-export class ProcessorService {
+export class ProcessorService implements OnModuleInit {
   constructor(
     @InjectRepository(EventMetadata)
-  private readonly eventRepo: Repository<EventMetadata>,
-) {}
+    private readonly eventRepo: Repository<EventMetadata>,
+  ) {}
 
   private readonly logger = new Logger(ProcessorService.name);
 
-  
+  private processedCount = 0;
+  private failedCount = 0;
+
+  onModuleInit() {
+    setInterval(() => {
+      this.logger.log(
+        {
+          processed: this.processedCount,
+          failed: this.failedCount,
+        },
+        'Metrics Snapshot',
+      );
+    }, 10000);
+  }
+
+  @Get('health')
+  getHealth() {
+    return {
+      status: 'ok',
+      service: 'processor-service',
+      timestamp: new Date(),
+    };
+  }
+
   private async bulkIndex(events: any[]) {
-  const index = getEventIndex();
+    const index = getEventIndex();
 
-  const body = [];
+    const body: any[] = [];
 
-  for (const event of events) {
-    body.push({
-      index: { _index: index, _id: event.eventId },
-    });
-
-    body.push({
-      eventId: event.eventId,
-      sourceId: event.sourceId,
-      eventType: event.payload.eventType,
-      timestamp: event.payload.timestamp,
-      metadata: event.payload.metadata,
-    });
-  }
-
-  const response = await openSearchClient.bulk({ body });
-
-  if (response.body.errors) {
-    this.logger.error('Bulk indexing had errors');
-  }
-}
-
-async processBatch(messages: any[]) {
-  const events = [];
-  const messageIds = [];
-
-  for (const [id, fields] of messages) {
-    try {
-      const event = this.parse(fields);
-
-      const existing = await this.eventRepo.findOne({
-        where: { id: event.eventId },
+    for (const event of events) {
+      body.push({
+        index: { _index: index, _id: event.eventId },
       });
 
-      if (existing) {
-        await redisClient.xack(
-          'events:ingestion',
-          'event-processors',
-          id,
-        );
-        continue;
-      }
-
-      await this.eventRepo.save({
-        id: event.eventId,
+      body.push({
+        eventId: event.eventId,
         sourceId: event.sourceId,
         eventType: event.payload.eventType,
-        eventTime: new Date(event.payload.timestamp),
-        status: 'PROCESSED',
+        timestamp: event.payload.timestamp,
+        metadata: event.payload.metadata,
       });
+    }
 
-      events.push(event);
-      messageIds.push(id);
+    const response = await openSearchClient.bulk({ body });
 
-    } catch (err) {
-      await this.handleFailure(id, fields, err);
+    if (response.body.errors) {
+      this.logger.error('Bulk indexing had errors');
     }
   }
 
-  if (events.length > 0) {
-    await this.bulkIndex(events);
-  }
+  async processBatch(messages: any[]) {
+    const events: any[] = [];
+    const messageIds: any[] = [];
 
-  if (messageIds.length > 0) {
-    await redisClient.xack(
-      'events:ingestion',
-      'event-processors',
-      ...messageIds,
-    );
+    for (const [id, fields] of messages) {
+      try {
+        const event = this.parse(fields);
+
+        const existing = await this.eventRepo.findOne({
+          where: { id: event.eventId },
+        });
+
+        if (existing) {
+          await redisClient.xack('events:ingestion', 'event-processors', id);
+          continue;
+        }
+
+        await this.eventRepo.save({
+          id: event.eventId,
+          sourceId: event.sourceId,
+          eventType: event.payload.eventType,
+          eventTime: new Date(event.payload.timestamp),
+          status: 'PROCESSED',
+        });
+
+        this.logger.log(
+          {
+            eventId: event.eventId,
+            sourceId: event.sourceId,
+            status: 'processed',
+          },
+          'Event processed successfully',
+        );
+
+        this.processedCount++;
+        events.push(event);
+        messageIds.push(id);
+      } catch (err) {
+        await this.handleFailure(id, fields, err);
+      }
+    }
+
+    if (events.length > 0) {
+      await this.bulkIndex(events);
+    }
+
+    if (messageIds.length > 0) {
+      await redisClient.xack(
+        'events:ingestion',
+        'event-processors',
+        ...messageIds,
+      );
+    }
   }
-}
 
   private parse(fields: any[]) {
     const obj: any = {};
@@ -101,36 +129,6 @@ async processBatch(messages: any[]) {
     obj.payload = JSON.parse(obj.payload);
     return obj;
   }
-
-  private async handleEvent(event: any) {
-  const existing = await this.eventRepo.findOne({
-    where: { id: event.eventId },
-  });
-
-  if (existing) {
-    return; 
-  }
-
-  await this.eventRepo.save({
-    id: event.eventId,
-    sourceId: event.sourceId,
-    eventType: event.payload.eventType,
-    eventTime: new Date(event.payload.timestamp),
-    status: 'PROCESSED',
-  });
-
-  await openSearchClient.index({
-  index: getEventIndex(),
-  body: {
-    eventId: event.eventId,
-    sourceId: event.sourceId,
-    eventType: event.payload.eventType,
-    timestamp: event.payload.timestamp,
-    metadata: event.payload.metadata,
-  },
-});
-
-}
 
   private async handleFailure(messageId: string, fields: any[], error: any) {
     const event = this.parse(fields);
@@ -152,6 +150,7 @@ async processBatch(messages: any[]) {
         'retryCount',
         event.retryCount.toString(),
       );
+      this.failedCount++;
 
       this.logger.warn(
         `Retrying event ${event.eventId}, attempt ${event.retryCount}`,
